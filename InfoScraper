@@ -1,0 +1,230 @@
+import asyncio
+import pandas as pd
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
+import requests
+import re
+
+PRODUCT_URL = "https://www.razimports.com/seasonal/christmas/{sku}"
+QTY_URL = "https://www.razimports.com/catalog/product/getActualStatus/"
+
+
+# ---------------------------------------------------------
+# HARDCODED COOKIES FROM YOUR BROWSER (Needed for qty API)
+# ---------------------------------------------------------
+RAZ_COOKIES = {
+    "STUID": "6287ff8d-b62c-0b0b-3501-47b7c229a041",
+    "STVID": "fb100d90-3914-ef2b-a2a7-f0ed2baabfc2",
+    "form_key": "k4lI2yKMLx3sikXJ",
+    "mage-banners-cache-storage": "{}",
+    "mage-messages": "",
+    "amcookie_policy_restriction": "allowed",
+    "PHPSESSID": "640bf5dfea61986fae1a0b654152cad1",
+    "X-Magento-Vary": "623a50248f9c3bf0d42166a2bdf3c087c5c72df9108fa79872386691473df46d",
+    "mage-cache-sessid": "true",
+    "mage-cache-storage": "{}",
+    "mage-cache-storage-section-invalidation": "{}",
+    "product_data_storage": "{}",
+    "private_content_version": "2235ee4bc0ac734bba930f64c82b35a0",
+    "section_data_ids": "{%22customer%22:1764137004%2C%22compare-products%22:1764137004%2C%22last-ordered-items%22:1764137004%2C%22requisition%22:1764137004%2C%22cart%22:1764137023%2C%22directory-data%22:1764137004%2C%22captcha%22:1764137004%2C%22wishlist%22:1764137004%2C%22company%22:1764137004%2C%22company_authorization%22:1764137004%2C%22instant-purchase%22:1764137004%2C%22loggedAsCustomer%22:1764137004%2C%22multiplewishlist%22:1764137004%2C%22persistent%22:1764137004%2C%22account-manager-portal-link%22:1764137004%2C%22recently_viewed_product%22:1764137004%2C%22recently_compared_product%22:1764137004%2C%22product_data_storage%22:1764137004}"
+}
+
+
+# ---------------------------------------------------------
+# SEND QTY REQUEST USING REAL COOKIES
+# ---------------------------------------------------------
+async def fetch_qty_available(sku, context):
+    cookies = await context.cookies()
+    raz_cookies = [c for c in cookies if "razimports" in c["domain"]]
+    cookie_dict = {c["name"]: c["value"] for c in raz_cookies}
+
+    form_key = cookie_dict.get("form_key", "")
+
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "origin": "https://www.razimports.com",
+        "referer": f"https://www.razimports.com/seasonal/christmas/{sku}",
+        "x-requested-with": "XMLHttpRequest",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+        )
+    }
+
+    payload = f"sku={sku}&form_key={form_key}"
+
+    resp = await context.request.post(QTY_URL, data=payload, headers=headers)
+
+    if resp.ok:
+        try:
+            data = await resp.json()
+            return data.get("actualStatus")
+        except:
+            return None
+
+    return None
+
+
+# ---------------------------------------------------------
+# PARSE PRICE BLOCK
+# ---------------------------------------------------------
+def extract_prices(soup):
+    price_box = soup.find("div", class_="price-box")
+    if not price_box:
+        return {
+            "case_price": None,
+            "case_qty": None,
+            "original_price_min_each": None,
+            "original_qty_min": None,
+            "original_price_case": None,
+            "original_qty_case": None
+        }
+
+    # Case price
+    case_price_tag = price_box.find("span", class_="price-container price-case_price")
+    if case_price_tag:
+        case_price = case_price_tag.find("span", class_="price").get_text(strip=True).replace("$", "")
+        case_qty_label = case_price_tag.find("span", class_="price-label").get_text(strip=True)
+    else:
+        case_price = None
+        case_qty_label = None
+
+    # Original minimum
+    min_block = price_box.find("span", class_="minimum-price-over")
+    if min_block:
+        original_price_min_each = min_block.find("span", class_="price").get_text(strip=True).replace("$", "")
+        original_qty_min = min_block.find("span", class_="origin-price-label").get_text(strip=True)
+    else:
+        original_price_min_each = None
+        original_qty_min = None
+
+    # Original case
+    case_block = price_box.find("span", class_="case-price-over")
+    if case_block:
+        original_price_case = case_block.find("span", class_="price").get_text(strip=True).replace("$", "")
+        original_qty_case = case_block.find("span", class_="origin-price-label").get_text(strip=True)
+    else:
+        original_price_case = None
+        original_qty_case = None
+
+    return {
+        "case_price": case_price,
+        "case_qty": case_qty_label,
+        "original_price_min_each": original_price_min_each,
+        "original_qty_min": original_qty_min,
+        "original_price_case": original_price_case,
+        "original_qty_case": original_qty_case
+    }
+
+
+# ---------------------------------------------------------
+# SCRAPE A SINGLE PRODUCT PAGE
+# ---------------------------------------------------------
+async def scrape_product(page, sku):
+    url = PRODUCT_URL.format(sku=sku)
+    print(f"Loading {url}")
+
+    await page.goto(url, timeout=60000, wait_until="networkidle")
+    html = await page.content()
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Name
+    title_tag = soup.find("title")
+    name = title_tag.get_text(strip=True) if title_tag else None
+
+    # Product ID
+    price_box = soup.find("div", attrs={"data-role": "priceBox"})
+    product_id = price_box["data-product-id"] if price_box else None
+
+    # UPC
+    upc_tag = soup.find("div", class_="product attribute upc-code")
+    upc = None
+    if upc_tag:
+        val = upc_tag.find("div", class_="value")
+        if val:
+            upc = val.get_text(strip=True)
+
+    # Bullets
+    bullets = []
+    bullet_block = soup.find("div", class_="attribute raz-product-bullet-attr")
+    if bullet_block:
+        for li in bullet_block.find_all("li"):
+            bullets.append(li.get_text(strip=True))
+
+    # Material & Dimensions
+    material = None
+    dimensions = None
+    extra_block = soup.find("ul", class_="raz-product-bullet-attr-extra")
+
+    if extra_block:
+        lis = extra_block.find_all("li")
+        if len(lis) > 0:
+            material = lis[0].get_text(strip=True)
+        if len(lis) > 1:
+            dimensions = lis[1].get_text(strip=True)
+
+    # Image URL
+    image_url = f"https://www.razimports.com/media/catalog_product/ImagesFiles2/{sku}.jpg?quality=100&bg-color=255,255,255&fit=bounds&height=1000&width=1000&canvas=1000:1000"
+
+    # Qty (FIXED)
+    qty_available = await fetch_qty_available(sku, page.context)
+
+    # Prices
+    price_data = extract_prices(soup)
+
+    # Final data
+    result = {
+        "sku": sku,
+        "name": name,
+        "upc": upc,
+        "product_id": product_id,
+        "qty_available": qty_available,
+        "image_url": image_url,
+        "material": material,
+        "dimensions": dimensions
+    }
+
+    result.update(price_data)
+
+    for i, bullet in enumerate(bullets):
+        result[f"bullet_{i+1}"] = bullet
+
+    return result
+
+
+# ---------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------
+async def main():
+    df_skus = pd.read_excel("raz_skus.xlsx")
+    first_sku = str(df_skus.iloc[0]["sku"])
+
+    print(f"PROCESSING FIRST SKU ONLY: {first_sku}")
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp("http://localhost:9222")
+        context = browser.contexts[0]
+        page = await context.new_page()
+        # Inject your own cookies manually
+        for name, value in RAZ_COOKIES.items():
+            await context.add_cookies([{
+                "name": name,
+                "value": value,
+                "domain": "www.razimports.com",
+                "path": "/",
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "Lax"
+            }])
+
+        data = await scrape_product(page, first_sku)
+
+        out_df = pd.DataFrame([data])
+        out_df.to_excel("raz_product_info.xlsx", index=False)
+
+        print("Saved → raz_product_info.xlsx")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
