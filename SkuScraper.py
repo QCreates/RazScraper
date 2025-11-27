@@ -5,7 +5,7 @@ from playwright.async_api import async_playwright
 import requests
 import traceback
 
-BASE_URL = "https://www.razimports.com/seasonal/christmas?p={page}&product_list_limit=36"
+BASE_URL = "https://www.razimports.com/in-stock/ready-to-ship?p={page}&product_list_limit=36"
 NUM_TABS = 12
 
 # GLOBAL STOP FLAG
